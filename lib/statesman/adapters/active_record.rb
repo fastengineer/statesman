@@ -72,19 +72,26 @@ module Statesman
         ::ActiveRecord::Base.transaction(requires_new: true) do
           @observer.execute(:before, from, to, transition)
 
-          # We save the transition first with most_recent falsy, then mark most_recent
-          # true after to avoid letting MySQL acquire a next-key lock which can cause
-          # deadlocks.
-          #
-          # To avoid an additional query, we manually adjust the most_recent attribute on
-          # our transition assuming that update_most_recents will have set it to true.
-          transition.save!
+          if db_mysql?
+            # We save the transition first with most_recent falsy, then mark most_recent
+            # true after to avoid letting MySQL acquire a next-key lock which can cause
+            # deadlocks.
+            #
+            # To avoid an additional query, we manually adjust the most_recent attribute
+            # on our transition assuming that update_most_recents will have set it to true
 
-          unless update_most_recents(transition.id) > 0
-            raise ActiveRecord::Rollback, "failed to update most_recent"
+            transition.save!
+
+            unless update_most_recents(transition.id) > 0
+              raise ActiveRecord::Rollback, "failed to update most_recent"
+            end
+
+            transition.assign_attributes(most_recent: true)
+          else
+            update_most_recents
+            transition.assign_attributes(most_recent: true)
+            transition.save!
           end
-
-          transition.assign_attributes(most_recent: true)
 
           @last_transition = transition
           @observer.execute(:after, from, to, transition)
@@ -123,18 +130,10 @@ module Statesman
 
       # Sets the given transition most_recent = t while unsetting the most_recent of any
       # previous transitions.
-      def update_most_recents(most_recent_id) # rubocop:disable Metrics/AbcSize
+      def update_most_recents(most_recent_id = nil)
         update = build_arel_manager(::Arel::UpdateManager)
         update.table(transition_table)
-
-        update.where(
-          transition_table[parent_join_foreign_key.to_sym].eq(parent_model.id).and(
-            transition_table[:id].eq(most_recent_id).or(
-              transition_table[:most_recent].eq(true),
-            ),
-          ),
-        )
-
+        update.where(most_recent_transitions(most_recent_id))
         update.set(build_most_recents_update_all_values(most_recent_id))
 
         # MySQL will validate index constraints across the intermediate result of an
@@ -142,7 +141,23 @@ module Statesman
         # most_recent before setting the new row to be true.
         update.order(transition_table[:most_recent].desc) if db_mysql?
 
-        ::ActiveRecord::Base.connection.exec_update(update.to_sql)
+        ::ActiveRecord::Base.connection.update(update.to_sql)
+      end
+
+      def most_recent_transitions(most_recent_id = nil)
+        if most_recent_id
+          transitions_of_parent.and(
+            transition_table[:id].eq(most_recent_id).or(
+              transition_table[:most_recent].eq(true),
+            ),
+          )
+        else
+          transitions_of_parent.and(transition_table[:most_recent].eq(true))
+        end
+      end
+
+      def transitions_of_parent
+        transition_table[parent_join_foreign_key.to_sym].eq(parent_model.id)
       end
 
       # Generates update_all Arel values that will touch the updated timestamp (if valid
@@ -160,32 +175,33 @@ module Statesman
       #        , updated_at = '...'
       #      ...
       #
-      # rubocop:disable Metrics/MethodLength
-      def build_most_recents_update_all_values(most_recent_id)
-        values = [
+      def build_most_recents_update_all_values(most_recent_id = nil)
+        [
           [
             transition_table[:most_recent],
-            Arel::Nodes::SqlLiteral.new(
-              Arel::Nodes::Case.new.
-                when(transition_table[:id].eq(most_recent_id)).then(true).
-                else(not_most_recent_value).to_sql,
-            ),
+            Arel::Nodes::SqlLiteral.new(most_recent_value(most_recent_id)),
           ],
-        ]
+        ].tap do |values|
+          # Only if we support the updated at timestamps should we add this column to the
+          # update
+          updated_column, updated_at = updated_timestamp
 
-        # Only if we support the updated at timestamps should we add this column to the
-        # update
-        updated_column, updated_at = updated_timestamp
-        if updated_column
-          values << [
-            transition_table[updated_column.to_sym],
-            updated_at,
-          ]
+          if updated_column
+            values << [
+              transition_table[updated_column.to_sym],
+              updated_at,
+            ]
+          end
         end
-
-        values
       end
-      # rubocop:enable Metrics/MethodLength
+
+      def most_recent_value(most_recent_id)
+        return Arel::Nodes::SqlLiteral.new(not_most_recent_value) unless most_recent_id
+
+        Arel::Nodes::Case.new.
+          when(transition_table[:id].eq(most_recent_id)).then(db_true).
+          else(not_most_recent_value).to_sql
+      end
 
       # Provide a wrapper for constructing an update manager which handles a breaking API
       # change in Arel as we move into Rails >6.0.
@@ -197,19 +213,6 @@ module Statesman
         else
           manager.new(::ActiveRecord::Base)
         end
-      end
-
-      # Check whether the `most_recent` column allows null values. If it doesn't, set old
-      # records to `false`, otherwise, set them to `NULL`.
-      #
-      # Some conditioning here is required to support databases that don't support partial
-      # indexes. By doing the conditioning on the column, rather than Rails' opinion of
-      # whether the database supports partial indexes, we're robust to DBs later adding
-      # support for partial indexes.
-      def not_most_recent_value
-        return db_false if transition_class.columns_hash["most_recent"].null == false
-
-        nil
       end
 
       def next_sort_key
@@ -308,6 +311,19 @@ module Statesman
           transition_class.columns_hash["most_recent"],
         )
         ::ActiveRecord::Base.connection.quote(value)
+      end
+
+      # Check whether the `most_recent` column allows null values. If it doesn't, set old
+      # records to `false`, otherwise, set them to `NULL`.
+      #
+      # Some conditioning here is required to support databases that don't support partial
+      # indexes. By doing the conditioning on the column, rather than Rails' opinion of
+      # whether the database supports partial indexes, we're robust to DBs later adding
+      # support for partial indexes.
+      def not_most_recent_value
+        return db_false if transition_class.columns_hash["most_recent"].null == false
+
+        nil
       end
     end
 
